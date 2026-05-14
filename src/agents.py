@@ -1,20 +1,19 @@
-"""Claude agent with tool-calling for flight and shopping search."""
+"""Gemini agent with tool-calling for flight and shopping search."""
 
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
-from anthropic import Anthropic
-from anthropic.types import ToolUseBlock, TextBlock
+import google.generativeai as genai
 
 from .config import Config
 from .tools.serpapi import search_flights, search_shopping
 
-
 from datetime import date
 
-TODAY = date.today()  # 2026-05-12
+TODAY = date.today()
 
 SYSTEM_PROMPT = f"""Bạn là Tara Bot — một agent thông minh chuyên tìm kiếm chuyến bay và săn giá đồ.
 
@@ -32,142 +31,97 @@ Mặc định cho các câu hỏi mơ hồ về thời gian:
 - "tuần sau" → tuần tiếp theo
 - Nếu không rõ, lấy ngày đi và ngày về hợp lý."""
 
-# ── Tool definitions (Anthropic format) ──────────────────────────────
-
-FLIGHT_TOOL: dict = {
-    "name": "search_flights",
-    "description": "Tìm chuyến bay. Trả về giá, hãng, giờ bay.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "departure_id": {
-                "type": "string",
-                "description": "Mã sân bay đi (IATA). Mặc định SGN",
-            },
-            "arrival_id": {
-                "type": "string",
-                "description": "Mã sân bay đến (IATA)",
-            },
-            "outbound_date": {
-                "type": "string",
-                "description": "Ngày đi (YYYY-MM-DD). Mặc định thứ 6 tuần sau.",
-            },
-            "return_date": {
-                "type": "string",
-                "description": "Ngày về (YYYY-MM-DD). Mặc định đi + 5 ngày.",
-            },
-            "adults": {
-                "type": "integer",
-                "description": "Số người lớn. Mặc định 1.",
-            },
-        },
-        "required": ["arrival_id"],
-    },
-}
-
-SHOPPING_TOOL: dict = {
-    "name": "search_shopping",
-    "description": "Tìm sản phẩm, so sánh giá. Hữu ích khi user hỏi về giá đồ.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Tên sản phẩm cần tìm (VD: iPhone 16, máy lọc không khí)",
-            },
-        },
-        "required": ["query"],
-    },
-}
-
-ALL_TOOLS = [FLIGHT_TOOL, SHOPPING_TOOL]
-
-# ── Tool dispatch ────────────────────────────────────────────────────
-
 TOOL_FUNCTIONS: dict[str, Any] = {
     "search_flights": search_flights,
     "search_shopping": search_shopping,
 }
 
+GEMINI_TOOLS = [
+    genai.protos.Tool(
+        function_declarations=[
+            genai.protos.FunctionDeclaration(
+                name="search_flights",
+                description="Tìm chuyến bay. Trả về giá, hãng, giờ bay.",
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "departure_id": genai.protos.Schema(type=genai.protos.Type.STRING, description="Mã sân bay đi (IATA). Mặc định SGN"),
+                        "arrival_id": genai.protos.Schema(type=genai.protos.Type.STRING, description="Mã sân bay đến (IATA)"),
+                        "outbound_date": genai.protos.Schema(type=genai.protos.Type.STRING, description="Ngày đi (YYYY-MM-DD)"),
+                        "return_date": genai.protos.Schema(type=genai.protos.Type.STRING, description="Ngày về (YYYY-MM-DD)"),
+                        "adults": genai.protos.Schema(type=genai.protos.Type.INTEGER, description="Số người lớn. Mặc định 1"),
+                    },
+                    required=["arrival_id"],
+                ),
+            ),
+            genai.protos.FunctionDeclaration(
+                name="search_shopping",
+                description="Tìm sản phẩm, so sánh giá.",
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "query": genai.protos.Schema(type=genai.protos.Type.STRING, description="Tên sản phẩm cần tìm"),
+                    },
+                    required=["query"],
+                ),
+            ),
+        ]
+    )
+]
+
 
 class Agent:
     def __init__(self):
-        self.client = Anthropic(api_key=Config.anthropic_api_key)
-        self.model = "claude-sonnet-4-6"
-        self.system = SYSTEM_PROMPT
-        self.history: list[dict] = []
+        genai.configure(api_key=Config.gemini_api_key)
+        self.model = genai.GenerativeModel(
+            model_name="gemini-2.0-flash",
+            system_instruction=SYSTEM_PROMPT,
+            tools=GEMINI_TOOLS,
+        )
+        self.chat_session = self.model.start_chat(history=[])
 
     def chat(self, user_message: str) -> str:
         """Send user message, execute tool calls if needed, return response."""
-        messages = list(self.history)
-        messages.append({"role": "user", "content": user_message})
+        for iteration in range(5):
+            if iteration == 0:
+                response = self.chat_session.send_message(user_message)
+            else:
+                response = self.chat_session.send_message(
+                    genai.protos.Content(parts=tool_response_parts, role="user")
+                )
 
-        for iteration in range(5):  # max 5 tool call loops
-            response = self._call_claude(messages)
+            parts = response.candidates[0].content.parts
+            text_parts = []
+            tool_calls = []
 
-            content_blocks = response.content
-            reply_text = ""
-            tool_use_blocks = []
-            text_blocks = []
+            for part in parts:
+                if hasattr(part, "text") and part.text:
+                    text_parts.append(part.text)
+                if hasattr(part, "function_call") and part.function_call.name:
+                    tool_calls.append(part.function_call)
 
-            for block in content_blocks:
-                if isinstance(block, TextBlock):
-                    text_blocks.append(block)
-                    reply_text += block.text
-                elif isinstance(block, ToolUseBlock):
-                    tool_use_blocks.append(block)
+            if not tool_calls:
+                return "".join(text_parts) or "Xin lỗi, em không hiểu yêu cầu. Thử lại nhé!"
 
-            if not tool_use_blocks:
-                # Done — save to history and return
-                self.history.append({"role": "user", "content": user_message})
-                self.history.append({"role": "assistant", "content": reply_text})
-                return reply_text
+            tool_response_parts = []
+            for call in tool_calls:
+                result = self._execute_tool(call.name, dict(call.args))
+                tool_response_parts.append(
+                    genai.protos.Part(
+                        function_response=genai.protos.FunctionResponse(
+                            name=call.name,
+                            response={"result": result},
+                        )
+                    )
+                )
 
-            # Execute all tools, then append ONE assistant + ONE user with all results
-            tool_results = []
-            for block in tool_use_blocks:
-                result = self._execute_tool(block)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(result),
-                })
-
-            messages.append({"role": "assistant", "content": content_blocks})
-            messages.append({"role": "user", "content": tool_results})
-
-        # Exceeded loop limit
         return "Xin lỗi, em không thể xử lý yêu cầu này ngay bây giờ. Thử lại với câu hỏi đơn giản hơn nhé!"
 
-    def _call_claude(self, messages: list) -> Any:
-        """Make Claude API call with retry on 429."""
-        import time
-
-        for attempt in range(3):
-            try:
-                return self.client.messages.create(
-                    model=self.model,
-                    max_tokens=4000,
-                    system=self.system,
-                    messages=messages,
-                    tools=ALL_TOOLS,
-                )
-            except Exception as exc:
-                err = str(exc)
-                if "429" in err or "rate_limit" in err.lower():
-                    wait = 30 * (attempt + 1)
-                    time.sleep(wait)
-                    continue
-                raise
-        raise Exception("Claude API: rate limit exceeded after 3 retries")
-
-    def _execute_tool(self, block: ToolUseBlock) -> str:
-        """Execute a tool and return the result string."""
-        fn = TOOL_FUNCTIONS.get(block.name)
+    def _execute_tool(self, name: str, args: dict) -> str:
+        fn = TOOL_FUNCTIONS.get(name)
         if not fn:
-            return f"Unknown tool: {block.name}"
-        args = {k: v for k, v in block.input.items()}
+            return f"Unknown tool: {name}"
         try:
             return fn(**args)
         except Exception as e:
-            return f"Lỗi khi chạy {block.name}: {e}"
+            return f"Lỗi khi chạy {name}: {e}"
